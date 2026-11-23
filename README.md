@@ -13,6 +13,8 @@ MechDiagBot 是一款面向工程设备现场的诊断智能体，可完全离�
 
 ---
 
+https://github.com/user-attachments/assets/8ae0762e-4282-4e92-ac1c-3488f97f97d9
+
 ## 目录
 
 - [MechDiagBot（设备诊断智能体）](#mechdiagbot设备诊断智能体)
