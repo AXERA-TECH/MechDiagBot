@@ -1,0 +1,59 @@
+{
+  "audio": {
+    "input_device": "default",
+    "output_device": "default",
+    "sample_rate": 16000,
+    "output_sample_rate": 24000,
+    "frame_ms": 20
+  },
+  "vad": {
+    "silence_ms": 300,
+    "min_speech_ms": 300,
+    "max_utterance_s": 15,
+    "pre_roll_ms": 300,
+    "energy_threshold": 0.0025,
+    "noise_ratio": 2.0
+  },
+  "wake": {
+    "provider": "sherpa_onnx",
+    "model": "models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
+    "word": "你好，阿克西娅",
+    "keywords_file": "",
+    "threshold": 0.25,
+    "keywords_score": 1.0,
+    "num_threads": 2,
+    "ack": "voice",
+    "ack_text": "我在",
+    "ack_audio": "",
+    "ack_timeout_seconds": 10,
+    "followup_timeout_ms": 15000
+  },
+  "asr": {
+    "base_url": "http://127.0.0.1:8021",
+    "api_key": "",
+    "model": "",
+    "language": "zh",
+    "timeout_seconds": 60
+  },
+  "tts": {
+    "base_url": "http://127.0.0.1:8028",
+    "api_key": "",
+    "model": "",
+    "voice": "",
+    "ref_audio": "",
+    "ref_text": "",
+    "source_sample_rate": 48000,
+    "timeout_seconds": 180,
+    "streaming": true,
+    "seed": "",
+    "max_steps": "",
+    "inference_timesteps": "",
+    "cfg_value": "",
+    "temperature": ""
+  },
+  "session": {
+    "machine_id": "cat-306-demo",
+    "operator_id": "voice-operator",
+    "session_id": ""
+  }
+}

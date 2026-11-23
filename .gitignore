@@ -16,3 +16,6 @@ runtime/
 .claude/settings.local.json
 nohup.out
 
+
+# 本地下载的唤醒模型（scripts/download_kws_model.sh）
+models/

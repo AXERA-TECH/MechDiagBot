@@ -5,7 +5,12 @@ import json
 from collections.abc import Sequence
 
 from cat_assistant.application.events import EventRecorder
-from cat_assistant.application.context import ContextBuilder
+from cat_assistant.application.context import (
+    ContextBuilder,
+    DIAGNOSTIC_SYSTEM_PROMPT,
+    GENERAL_SYSTEM_PROMPT,
+    machine_facts,
+)
 from cat_assistant.application.tools import ToolRegistry
 from cat_assistant.domain.models import (
     AssistantResponse,
@@ -67,21 +72,8 @@ class BoundedAgentRunner:
             messages = list(initial_messages)
         elif self._context_builder is None:
             messages = [
-                ChatMessage(
-                    role="system",
-                    content=(
-                        "You are a read-only equipment diagnostic assistant. "
-                        "Use only the supplied tools, cite document sources, and never "
-                        "claim to have changed or controlled the machine."
-                    ),
-                ),
-                ChatMessage(
-                    role="system",
-                    content=(
-                        f"Machine: {machine.model}; serial={machine.serial_number}; "
-                        f"state={machine.operating_state}; faults={list(machine.fault_codes)}"
-                    ),
-                ),
+                ChatMessage(role="system", content=DIAGNOSTIC_SYSTEM_PROMPT),
+                ChatMessage(role="system", content=machine_facts(machine)),
                 ChatMessage(role="user", content=user_text),
             ]
         else:
@@ -200,4 +192,62 @@ class BoundedAgentRunner:
             "诊断步骤已达到本机安全限制，未形成可靠结论，请由维修技师继续检查。",
             ResponseCategory.ERROR,
             metadata={"reason": "max_steps"},
+        )
+
+    async def run_general(
+        self,
+        *,
+        session_id: str,
+        user_text: str,
+        operator_id: str | None = None,
+    ) -> AssistantResponse:
+        """Answer a device-independent turn without telemetry or tools.
+
+        The console starts with no device attached. General questions still need
+        the same model, history and memory budget, but exposing tools or the
+        device facts prompt would let a small model pretend it has live readings
+        or attempt control. This path therefore always calls the model with an
+        empty tool list and a prompt that states the missing attachment.
+        """
+        if self._context_builder is None:
+            messages = [
+                ChatMessage(role="system", content=GENERAL_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=user_text),
+            ]
+        else:
+            messages = list(
+                await self._context_builder.build_general(
+                    session_id=session_id,
+                    user_text=user_text,
+                    operator_id=operator_id,
+                )
+            )
+        await self._events.record("step/started", session_id, step=1, mode="general")
+        try:
+            reply = await asyncio.wait_for(
+                self._model.complete(messages, ()),
+                timeout=self._model_call_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            await self._events.record(
+                "model/timeout",
+                session_id,
+                step=1,
+                timeout_seconds=self._model_call_timeout_seconds,
+            )
+            return AssistantResponse(
+                "模型响应超过安全时间限制，暂时无法回答。",
+                ResponseCategory.ERROR,
+                metadata={
+                    "reason": "model_timeout",
+                    "timeout_seconds": self._model_call_timeout_seconds,
+                    "mode": "general",
+                },
+            )
+        text = reply.content.strip() or "我暂时无法回答这个问题，请换一种说法再试。"
+        await self._events.record("step/completed", session_id, step=1, mode="general")
+        return AssistantResponse(
+            text,
+            ResponseCategory.INFORMATION,
+            metadata={"mode": "general", "machine_attached": False},
         )

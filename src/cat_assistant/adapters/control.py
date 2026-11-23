@@ -3,6 +3,11 @@ from __future__ import annotations
 import dataclasses
 from typing import Protocol
 
+from cat_assistant.application.intent import (
+    ControlIntent,
+    control_command,
+    has_negation_cue,
+)
 from cat_assistant.domain.models import ControlOutcome, MachineSnapshot
 
 
@@ -21,27 +26,21 @@ class SimulatedMachineControl:
 
     The device it acts on is itself simulated (see ``demo_snapshots``); this
     executor simply completes that simulation rather than controlling hardware.
+    Negated, questioning or self-contradictory text is refused even though a
+    plan reached this point, because the request text is what the actuator
+    ultimately executes.
     """
-
-    _STOP_TERMS = (
-        "停止",
-        "停机",
-        "熄火",
-        "关闭",
-        "关机",
-        "shutdown",
-        "stop",
-        "power off",
-        "turn off",
-    )
-    _START_TERMS = ("启动", "开机", "点火", "start", "power on", "turn on")
 
     def __init__(self, telemetry: SupportsSnapshotWrite) -> None:
         self._telemetry = telemetry
 
     async def apply(self, request: str, *, machine: MachineSnapshot) -> ControlOutcome:
-        lowered = request.casefold()
-        if any(term in lowered for term in self._STOP_TERMS):
+        command = control_command(request)
+        if command is ControlIntent.QUESTION:
+            return self._refused(request, "该请求是询问语气，未被当作操作指令。")
+        if command is ControlIntent.CONFLICT:
+            return self._refused(request, "指令同时包含启动与停止，请分开下达。")
+        if command is ControlIntent.STOP:
             updated = dataclasses.replace(
                 machine, engine_running=False, operating_state="熄火"
             )
@@ -54,7 +53,7 @@ class SimulatedMachineControl:
                 ),
                 machine=updated,
             )
-        if any(term in lowered for term in self._START_TERMS):
+        if command is ControlIntent.START:
             updated = dataclasses.replace(
                 machine, engine_running=True, operating_state="怠速"
             )
@@ -67,6 +66,8 @@ class SimulatedMachineControl:
                 ),
                 machine=updated,
             )
+        if has_negation_cue(request):
+            return self._refused(request, "检测到否定或取消语义，未执行设备动作。")
         # A control request the simulator cannot map to a snapshot field is still
         # accepted and recorded, so the full chain stays connected end to end.
         return ControlOutcome(
@@ -75,6 +76,14 @@ class SimulatedMachineControl:
                 f"已通过虚拟安全网关下发指令：{request}。"
                 "（仿真执行器已记录该动作，未改变具体遥测字段。）"
             ),
+            machine=None,
+        )
+
+    @staticmethod
+    def _refused(request: str, reason: str) -> ControlOutcome:
+        return ControlOutcome(
+            accepted=False,
+            summary=f"虚拟安全网关拒绝执行：{request}。{reason}",
             machine=None,
         )
 

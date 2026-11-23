@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "equip-ai-agent"
 version = "0.1.0"
-description = "Minimal offline-first architecture for an edge equipment voice assistant"
+description = "MechDiagBot: offline-first diagnostic agent for industrial equipment"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -16,10 +16,20 @@ dependencies = []
 # LANGFUSE_SECRET_KEY (and optionally LANGFUSE_BASE_URL) to enable Langfuse traces.
 # Targets the OTEL-based SDK (v3/v4); the adapter degrades to no-op otherwise.
 tracing = ["langfuse>=3,<5"]
+# Voice is also opt-in: CLI/网页录音需要 numpy + sounddevice；本地唤醒词
+# （sherpa-onnx）额外包含在 voice-wake 中。ASR/TTS 模型仍由独立的 HTTP 服务提供。
+voice = ["numpy>=1.24", "sounddevice>=0.4"]
+voice-wake = [
+    "numpy>=1.24",
+    "sounddevice>=0.4",
+    "sherpa-onnx>=1.13,<2.1",
+    "pypinyin>=0.53",
+]
 
 [project.scripts]
 equip = "cat_assistant.__main__:main"
 equip-ui = "cat_assistant.debug_ui:main"
+equip-voice = "cat_assistant.voice.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 60 1400 890" width="1400" height="890" role="img" aria-labelledby="title desc">
+  <title id="title">Cat Edge Assistant 请求与响应架构</title>
+  <desc id="desc">实线表示当前已实现链路，虚线或规划注释表示生产扩展。用户请求经渠道进入 AgentLoop，获取实时遥测后交给 TaskOrchestrator。普通请求生成新计划，确认请求恢复当前内存中的待审批计划。PlanExecutor 对每一步依次执行策略检查、能力注册表和 Provider，收集 StepResult 与 Artifact，最终构造 AssistantResponse，由 AgentLoop 持久化并通过渠道返回用户。</desc>
+  <style>
+    text { font-family: 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif; font-synthesis: none; }
+    .layer-title { fill: #334155; font-size: 13px; font-weight: 700; letter-spacing: .04em; }
+    .node-title { fill: #0f172a; font-size: 16px; font-weight: 700; }
+    .node-sub { fill: #475569; font-size: 13px; font-weight: 400; }
+    .edge-label { fill: #334155; font-size: 12px; font-weight: 600; }
+  </style>
+  <defs>
+    <marker id="arrow-blue" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" fill="#ea580c"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 7 2.5, 0 5" fill="#9333ea"/>
+    </marker>
+  </defs>
+
+  <rect width="1400" height="1000" fill="#ffffff"/>
+
+  <!-- containers -->
+  <rect x="50" y="84" width="1300" height="146" rx="10" fill="#eff6ff" fill-opacity=".58" stroke="#bfdbfe" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text class="layer-title" x="72" y="106">1  接收用户请求</text>
+  <rect x="50" y="254" width="1300" height="244" rx="10" fill="#faf5ff" fill-opacity=".5" stroke="#d8b4fe" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text class="layer-title" x="72" y="278">2  生成或恢复任务计划</text>
+  <rect x="50" y="522" width="1300" height="276" rx="10" fill="#f0fdf4" fill-opacity=".56" stroke="#bbf7d0" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text class="layer-title" x="72" y="546">3  安全执行任务步骤</text>
+  <rect x="50" y="822" width="1300" height="112" rx="10" fill="#eff6ff" fill-opacity=".48" stroke="#bfdbfe" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text class="layer-title" x="72" y="846">4  保存并返回结果</text>
+
+  <!-- arrows: ingress and turn boundary -->
+  <path d="M 220 157 H 278" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <path d="M 500 157 H 558" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <path d="M 822 139 H 890" fill="none" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <path d="M 890 177 H 822" fill="none" stroke="#16a34a" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <path d="M 780 194 V 210 H 1240 V 194" fill="none" stroke="#9333ea" stroke-width="1.7" stroke-dasharray="6 4" marker-end="url(#arrow-purple)"/>
+  <path d="M 690 194 V 294" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+
+  <!-- arrows: planning -->
+  <path d="M 630 358 V 382 H 220 V 406" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <path d="M 340 449 H 438" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <path d="M 688 449 H 788" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <path d="M 750 358 V 382 H 1215 V 406" fill="none" stroke="#ea580c" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path d="M 1090 449 H 1038" fill="none" stroke="#ea580c" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path d="M 913 492 V 574" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+
+  <!-- arrows: step execution loop -->
+  <path d="M 788 617 H 748" fill="none" stroke="#ea580c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <path d="M 995 660 V 674 H 860 V 686" fill="none" stroke="#ea580c" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <path d="M 498 617 H 420" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <path d="M 260 660 V 686" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <path d="M 420 729 H 488" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <path d="M 652 729 H 738" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <path d="M 570 771 V 786 H 710 V 674 H 770 V 558 H 835 V 574" fill="none" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <path d="M 898 729 H 1010" fill="none" stroke="#16a34a" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <path d="M 1140 772 V 810 H 738 V 862" fill="none" stroke="#16a34a" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+
+  <!-- arrows: delivery -->
+  <path d="M 868 891 H 948" fill="none" stroke="#16a34a" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <path d="M 1168 891 H 1228" fill="none" stroke="#16a34a" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+
+  <!-- ingress nodes -->
+  <g>
+    <rect x="70" y="124" width="150" height="66" rx="9" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+    <text class="node-title" x="145" y="151" text-anchor="middle">用户或调用方</text>
+    <text class="node-sub" x="145" y="172" text-anchor="middle">文本、语音、IM</text>
+  </g>
+  <g>
+    <rect x="278" y="124" width="222" height="66" rx="9" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+    <text class="node-title" x="389" y="151" text-anchor="middle">Channel 与 Host</text>
+    <text class="node-sub" x="389" y="172" text-anchor="middle">CLI、Web UI、Webhook</text>
+  </g>
+  <g>
+    <rect x="558" y="120" width="264" height="74" rx="10" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <rect x="562" y="124" width="256" height="66" rx="8" fill="none" stroke="#bfdbfe" stroke-width="1"/>
+    <text class="node-title" x="690" y="149" text-anchor="middle">AgentLoop.handle()</text>
+    <text class="node-sub" x="690" y="170" text-anchor="middle">会话锁与 Turn 生命周期</text>
+  </g>
+  <g>
+    <rect x="890" y="120" width="210" height="74" rx="9" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+    <text class="node-title" x="995" y="149" text-anchor="middle">MachineTelemetryPort</text>
+    <text class="node-sub" x="995" y="170" text-anchor="middle">实时 MachineSnapshot</text>
+  </g>
+  <g>
+    <rect x="1150" y="120" width="180" height="74" rx="9" fill="#faf5ff" stroke="#c084fc" stroke-width="1.5" stroke-dasharray="5 3"/>
+    <text class="node-title" x="1240" y="149" text-anchor="middle">持久化端口</text>
+    <text class="node-sub" x="1240" y="170" text-anchor="middle">Session / Memory / Event</text>
+  </g>
+  <text class="edge-label" x="852" y="132">读取</text>
+  <text class="edge-label" x="852" y="190">快照</text>
+
+  <!-- planning nodes -->
+  <g>
+    <rect x="550" y="294" width="280" height="64" rx="10" fill="#faf5ff" stroke="#a78bfa" stroke-width="2"/>
+    <text class="node-title" x="690" y="320" text-anchor="middle">TaskOrchestrator.handle()</text>
+    <text class="node-sub" x="690" y="341" text-anchor="middle">管理 Session 待审批计划</text>
+  </g>
+  <g>
+    <rect x="100" y="406" width="240" height="86" rx="9" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+    <text class="node-title" x="220" y="434" text-anchor="middle">TaskPlanner.build()</text>
+    <text class="node-sub" x="220" y="462" text-anchor="middle">Tool Calling 或离线规则</text>
+  </g>
+  <g>
+    <rect x="438" y="406" width="250" height="86" rx="9" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+    <text class="node-title" x="563" y="434" text-anchor="middle">TaskPlan</text>
+    <text class="node-sub" x="563" y="462" text-anchor="middle">步骤、参数、依赖</text>
+  </g>
+  <g>
+    <rect x="788" y="406" width="250" height="86" rx="9" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.7"/>
+    <text class="node-title" x="913" y="434" text-anchor="middle">PlanExecutor.execute()</text>
+    <text class="node-sub" x="913" y="462" text-anchor="middle">按 DAG 依赖逐步执行</text>
+  </g>
+  <g>
+    <rect x="1090" y="406" width="250" height="86" rx="9" fill="#fff7ed" stroke="#fb923c" stroke-width="1.5"/>
+    <text class="node-title" x="1215" y="434" text-anchor="middle">Pending TaskPlan</text>
+    <text class="node-sub" x="1215" y="462" text-anchor="middle">当前内存态；确认后批准重执行</text>
+  </g>
+  <text class="edge-label" x="408" y="375">普通请求</text>
+  <text class="edge-label" x="985" y="375">确认请求</text>
+
+  <!-- execution nodes -->
+  <g>
+    <rect x="788" y="574" width="250" height="86" rx="9" fill="#fff7ed" stroke="#fb923c" stroke-width="1.7"/>
+    <text class="node-title" x="913" y="602" text-anchor="middle">PolicyEngine.evaluate()</text>
+    <text class="node-sub" x="913" y="630" text-anchor="middle">Policy Gate：放行、待审批或拒绝</text>
+  </g>
+  <g>
+    <rect x="498" y="574" width="250" height="86" rx="9" fill="#ffffff" stroke="#4ade80" stroke-width="1.6"/>
+    <text class="node-title" x="623" y="602" text-anchor="middle">CapabilityRegistry</text>
+    <text class="node-sub" x="623" y="630" text-anchor="middle">校验、超时与 Provider 调度</text>
+  </g>
+  <g>
+    <rect x="100" y="574" width="320" height="86" rx="9" fill="#ffffff" stroke="#4ade80" stroke-width="1.6"/>
+    <text class="node-title" x="260" y="602" text-anchor="middle">CapabilityProvider.execute()</text>
+    <text class="node-sub" x="260" y="630" text-anchor="middle">遥测、知识、诊断；控制为虚拟网关</text>
+  </g>
+  <g>
+    <rect x="100" y="686" width="320" height="86" rx="9" fill="#f0fdf4" stroke="#4ade80" stroke-width="1.6"/>
+    <text class="node-title" x="260" y="714" text-anchor="middle">CapabilityResult</text>
+    <text class="node-sub" x="260" y="742" text-anchor="middle">状态、内容与产物</text>
+  </g>
+  <g>
+    <polygon points="570,687 652,729 570,771 488,729" fill="#ffffff" stroke="#60a5fa" stroke-width="1.6"/>
+    <text class="node-title" x="570" y="725" text-anchor="middle">是否还有步骤</text>
+    <text class="node-sub" x="570" y="743" text-anchor="middle">就绪步骤</text>
+  </g>
+  <g>
+    <rect x="738" y="686" width="160" height="86" rx="9" fill="#f0fdf4" stroke="#4ade80" stroke-width="1.6"/>
+    <text class="node-title" x="818" y="714" text-anchor="middle">聚合结果</text>
+    <text class="node-sub" x="818" y="742" text-anchor="middle">完成、失败或待审批；验证可选</text>
+  </g>
+  <g>
+    <rect x="1010" y="686" width="260" height="86" rx="9" fill="#dcfce7" stroke="#22c55e" stroke-width="2"/>
+    <text class="node-title" x="1140" y="714" text-anchor="middle">AssistantResponse</text>
+    <text class="node-sub" x="1140" y="742" text-anchor="middle">文本、分类与元数据</text>
+  </g>
+  <text class="edge-label" x="456" y="608">放行</text>
+  <text class="edge-label" x="650" y="779">下一步</text>
+  <text class="edge-label" x="953" y="720">否</text>
+
+  <!-- output nodes -->
+  <g>
+    <rect x="608" y="862" width="260" height="58" rx="9" fill="#eff6ff" stroke="#60a5fa" stroke-width="1.6"/>
+    <text class="node-title" x="738" y="887" text-anchor="middle">AgentLoop 完成 Turn</text>
+    <text class="node-sub" x="738" y="907" text-anchor="middle">记录响应；审批计划不持久化</text>
+  </g>
+  <g>
+    <rect x="948" y="862" width="220" height="58" rx="9" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+    <text class="node-title" x="1058" y="887" text-anchor="middle">Channel 与 Host 投递</text>
+    <text class="node-sub" x="1058" y="907" text-anchor="middle">消息或 HTTP 响应</text>
+  </g>
+  <g>
+    <rect x="1228" y="862" width="102" height="58" rx="9" fill="#dcfce7" stroke="#22c55e" stroke-width="1.6"/>
+    <text class="node-title" x="1279" y="887" text-anchor="middle">用户</text>
+    <text class="node-sub" x="1279" y="907" text-anchor="middle">收到响应</text>
+  </g>
+
+  <!-- implementation status legend -->
+  <g>
+    <line x1="72" y1="946" x2="122" y2="946" stroke="#2563eb" stroke-width="2.2"/>
+    <text class="edge-label" x="132" y="950">当前已实现链路</text>
+    <line x1="322" y1="946" x2="372" y2="946" stroke="#9333ea" stroke-width="1.7" stroke-dasharray="6 4"/>
+    <text class="edge-label" x="382" y="950">生产规划 / 可选扩展</text>
+    <text class="edge-label" x="650" y="950">machine.control：审批后执行；当前为虚拟 Safety Gateway</text>
+  </g>
+
+</svg>

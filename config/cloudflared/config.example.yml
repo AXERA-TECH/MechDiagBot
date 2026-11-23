@@ -1,0 +1,14 @@
+# Example for a named Cloudflare Tunnel.
+# Copy this file to a private location and replace the placeholders.
+# Do not commit tunnel credentials or certificates.
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /REPLACE/WITH/PRIVATE/PATH/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: assistant.example.com
+    service: http://127.0.0.1:8765
+    originRequest:
+      # Keep the origin local; Cloudflare terminates public HTTPS.
+      httpHostHeader: 127.0.0.1:8765
+  - service: http_status:404

@@ -12,7 +12,7 @@ from cat_assistant.domain.models import Utterance
 async def run_cli(config_path: Path | None = None) -> None:
     app = build_demo_app(config_path=config_path)
     session_id = str(uuid4())
-    print("Equip AI Agent demo. 输入 exit 退出。")
+    print("MechDiagBot demo. 输入 exit 退出。")
     try:
         while True:
             # This demo owns the terminal and has no concurrent channel work.
@@ -36,7 +36,7 @@ async def run_cli(config_path: Path | None = None) -> None:
 
 def main() -> None:
     load_env_file()
-    parser = argparse.ArgumentParser(description="Run the Equip AI Agent edge assistant CLI")
+    parser = argparse.ArgumentParser(description="Run the MechDiagBot edge assistant CLI")
     parser.add_argument(
         "--config-path",
         type=Path,

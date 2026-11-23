@@ -24,7 +24,7 @@ class DemoRuleBasedModel:
             message
             for message in messages
             if message.role == "system"
-            and message.content.startswith("Collected knowledge evidence")
+            and message.content.startswith("以下为检索到的手册证据")
         ]
         # Knowledge evidence already gathered upstream and injected into context:
         # synthesize from it directly, regardless of whether search tools are
@@ -58,6 +58,34 @@ class DemoRuleBasedModel:
                 return ModelReply(
                     content=f"{first['content']} 来源：{first['source']}。"
                 )
+        # General lane: no device is attached. The offline demo double cannot
+        # answer open-domain questions, but it must still behave like a
+        # conversation instead of claiming a failed manual lookup.
+        if any(
+            message.role == "system" and "当前未接入任何设备" in message.content
+            for message in messages
+        ):
+            question = next(
+                (
+                    message.content
+                    for message in reversed(messages)
+                    if message.role == "user"
+                ),
+                "",
+            )
+            if any(word in question.casefold() for word in ("你好", "您好", "hi", "hello")):
+                return ModelReply(
+                    content=(
+                        "你好！当前尚未接入设备，我可以先回答通用问题；"
+                        "如需查询实时状态或诊断故障，请从左侧设备列表接入设备。"
+                    )
+                )
+            return ModelReply(
+                content=(
+                    "当前尚未接入设备，无法读取实时遥测或故障码。"
+                    "接入左侧设备后我可以做状态查询与故障诊断；通用设备知识也可以先问我。"
+                )
+            )
         return ModelReply(content="本机没有找到与该问题匹配的已验证资料。")
 
 

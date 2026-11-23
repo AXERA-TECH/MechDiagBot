@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 from cat_assistant.domain.models import (
+    AssistantResponse,
     ChatMessage,
     ControlOutcome,
     DomainEvent,
@@ -15,7 +16,19 @@ from cat_assistant.domain.models import (
     ToolExecutionContext,
     ToolSpec,
     TurnRecord,
+    Utterance,
 )
+
+
+class AgentHandlePort(Protocol):
+    """Inbound boundary implemented by the agent loop.
+
+    Channels and the voice gateway depend on this shape, not on ``AgentLoop``
+    itself, so any host object that turns an utterance into a response can be
+    plugged in.
+    """
+
+    async def handle(self, utterance: Utterance) -> AssistantResponse: ...
 
 
 class MachineTelemetryPort(Protocol):

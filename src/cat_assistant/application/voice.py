@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cat_assistant.application.loop import AgentLoop
 from cat_assistant.domain.models import AssistantResponse, ResponseCategory, Utterance
-from cat_assistant.domain.ports import SpeechRecognizerPort, SpeechSynthesizerPort
+from cat_assistant.domain.ports import (
+    AgentHandlePort,
+    SpeechRecognizerPort,
+    SpeechSynthesizerPort,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +23,7 @@ class VoiceGateway:
         self,
         recognizer: SpeechRecognizerPort,
         synthesizer: SpeechSynthesizerPort,
-        loop: AgentLoop,
+        loop: AgentHandlePort,
         *,
         minimum_confidence: float = 0.65,
     ) -> None:

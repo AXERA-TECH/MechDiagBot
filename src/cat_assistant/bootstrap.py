@@ -10,7 +10,11 @@ from cat_assistant.adapters.memory import JsonlMemoryStore, JsonlSessionStore
 from cat_assistant.adapters.model import DemoRuleBasedModel, OpenAICompatibleModel
 from cat_assistant.adapters.capabilities import builtin_capability_providers
 from cat_assistant.adapters.control import SimulatedMachineControl
-from cat_assistant.adapters.telemetry import InMemoryTelemetry, demo_snapshots
+from cat_assistant.adapters.telemetry import (
+    DemoFleetTelemetry,
+    InMemoryTelemetry,
+    demo_snapshots,
+)
 from cat_assistant.adapters.tracing import LangfuseTracer, TracedLanguageModel
 from cat_assistant.adapters.simulation import ScenarioTelemetry, get_simulation_scenario
 from cat_assistant.application.events import EventRecorder
@@ -39,6 +43,7 @@ def build_demo_app(
     config_path: Path | None = None,
     simulation_scenario: str | None = None,
     simulation_phase: int = 0,
+    live_fleet: bool = False,
     tracer: Tracer | None = None,
 ) -> AgentLoop:
     scenario = get_simulation_scenario(simulation_scenario) if simulation_scenario else None
@@ -49,7 +54,14 @@ def build_demo_app(
         # machine.control safely denies rather than fighting the replay.
         machine_control = None
     else:
-        telemetry = InMemoryTelemetry(demo_snapshots())
+        # ``live_fleet`` makes the demo picker feel alive: every 10 minutes the
+        # fleet reshuffles which machines carry active faults (2 faulted / 1 clean
+        # / 1 shut down). Tests leave it off for deterministic, static snapshots.
+        telemetry = (
+            DemoFleetTelemetry(demo_snapshots())
+            if live_fleet
+            else InMemoryTelemetry(demo_snapshots())
+        )
         knowledge = InMemoryKnowledge(demo_documents())
         # Bind a virtual Safety Gateway so the propose -> approve -> execute
         # chain completes end to end against the (already simulated) telemetry.
@@ -80,19 +92,30 @@ def build_demo_app(
     model_timeout = float(model_config.get("model_call_timeout_seconds", 60.0)) if model_config else 60.0
     tool_timeout = float(model_config.get("tool_call_timeout_seconds", 30.0)) if model_config else 30.0
     turn_timeout = float(model_config.get("turn_timeout_seconds", 120.0)) if model_config else 120.0
+    # Edge backends (AXera AXLLM) run tiny models with a ~2K-token context
+    # window; the default 8-turn / 12k-char budget overflows it once a couple of
+    # diagnostic answers accumulate in history. Keep only the last turn or two and
+    # a tight char backstop for that provider so the prompt + spliced evidence +
+    # the model's own output fit; larger cloud models keep the roomy budget.
+    provider = str(model_config.get("provider", "demo")) if model_config else "demo"
+    if provider == "axllm":
+        history_limit, max_chars = 2, 900
+    else:
+        history_limit, max_chars = 8, 12_000
+    context_builder = ContextBuilder(
+        session_store,
+        memory_store,
+        history_limit=history_limit,
+        max_chars=max_chars,
+    )
     runner = BoundedAgentRunner(
         model,
         tools,
         events,
         max_steps=max_steps,
+        context_builder=context_builder,
         model_call_timeout_seconds=model_timeout,
         tool_call_timeout_seconds=tool_timeout,
-    )
-    context_builder = ContextBuilder(
-        session_store,
-        memory_store,
-        history_limit=8,
-        max_chars=12_000,
     )
     query_service = DeterministicQueryService()
     for provider in builtin_capability_providers(
@@ -133,7 +156,8 @@ def build_demo_app(
     )
     orchestrator = TaskOrchestrator(
         planner,
-        PlanExecutor(capabilities, PolicyEngine(), events),
+        PlanExecutor(capabilities, PolicyEngine(), events, telemetry=telemetry),
+        events=events,
     )
     app = AgentLoop(
         telemetry=telemetry,

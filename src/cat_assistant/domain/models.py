@@ -13,6 +13,7 @@ class ResponseCategory(str, Enum):
     CLARIFICATION = "clarification"
     ERROR = "error"
     APPROVAL_REQUIRED = "approval_required"
+    ACTION_COMPLETED = "action_completed"
 
 
 @dataclass(frozen=True, slots=True)

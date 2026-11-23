@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -17,13 +18,16 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from cat_assistant.adapters.runtime_config import RuntimeConfigStore
+from cat_assistant.adapters.telemetry import fault_code_catalog
 from cat_assistant.application.loop import AgentLoop
 from cat_assistant.bootstrap import build_demo_app, load_env_file
 from cat_assistant.adapters.simulation import get_simulation_scenario, simulation_catalog
 from cat_assistant.domain.models import MemoryRecord, Utterance
+from cat_assistant.voice.config import load_voice_config
 
 
 UI_ROOT = Path(__file__).with_name("ui")
+_VOICE_STREAM_END = object()
 
 
 def _jsonable(value: Any) -> Any:
@@ -46,22 +50,31 @@ class DebugRuntime:
         event_path: Path,
         config_path: Path | None = None,
         *,
+        voice_config_path: Path | None = None,
         simulation_scenario: str | None = None,
         simulation_phase: int = 0,
+        live_fleet: bool = False,
     ) -> None:
         self.event_path = event_path
         self.config_path = config_path or event_path.with_name("runtime-config.json")
+        self.voice_config_path = (
+            voice_config_path or event_path.with_name("voice-config.json")
+        )
         self.simulation_scenario = simulation_scenario
         self.simulation_phase = simulation_phase
+        self.live_fleet = live_fleet
         self.config_store = RuntimeConfigStore(self.config_path)
         self.app = build_demo_app(
             event_path,
             config_path=self.config_path,
             simulation_scenario=simulation_scenario,
             simulation_phase=simulation_phase,
+            live_fleet=live_fleet,
         )
         self._loop = asyncio.new_event_loop()
         self._call_lock = threading.Lock()
+        self._voice_service = None
+        self._voice_lock = threading.Lock()
 
     def call(self, make_coroutine: Callable[[], Any]) -> Any:
         # ThreadingHTTPServer may invoke handlers on different threads. Run all
@@ -101,7 +114,14 @@ class DebugRuntime:
         session_id: str,
         operator_id: str = "debug-operator",
     ) -> dict[str, Any]:
-        machine = self.call(lambda: self.app.get_machine_snapshot(machine_id))
+        # Empty machine_id is the general, unbound lane: no telemetry read, only
+        # device-independent capabilities/configuration plus that lane's turns.
+        machine_id = machine_id.strip()
+        machine = (
+            self.call(lambda: self.app.get_machine_snapshot(machine_id))
+            if machine_id
+            else None
+        )
         turns = self.call(
             lambda: self.app.get_recent_turns(
                 session_id,
@@ -110,6 +130,14 @@ class DebugRuntime:
                 limit=30,
             )
         )
+        return self._state_payload(machine, turns, session_id)
+
+    def _state_payload(
+        self,
+        machine: Any,
+        turns: tuple[Any, ...],
+        session_id: str,
+    ) -> dict[str, Any]:
         manifests = self.app.plugin_manager.plugins if self.app.plugin_manager else ()
         simulation = None
         if self.simulation_scenario:
@@ -124,9 +152,10 @@ class DebugRuntime:
                 "sample": _jsonable(sample),
             }
         return {
-            "machine": _jsonable(machine),
+            "machine": _jsonable(machine) if machine is not None else None,
             "tools": _jsonable(self.app.tool_specs),
             "capabilities": _jsonable(self.app.capability_inventory),
+            "fault_catalog": fault_code_catalog(),
             "plugins": _jsonable(manifests),
             "mcp_servers": self.config_store.snapshot()["mcp_servers"],
             "skills": [],
@@ -187,6 +216,82 @@ class DebugRuntime:
         removed = self.call(lambda: self.app.clear_session(session_id))
         return {"ok": True, "session_id": session_id, "removed_turns": removed}
 
+    # ---------------------------------------------------------------- 语音
+    def _voice(self):
+        with self._voice_lock:
+            if self._voice_service is None:
+                try:
+                    from cat_assistant.voice.web import WebVoiceService
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "未安装语音依赖：pip install 'equip-ai-agent[voice]'"
+                    ) from exc
+                self._voice_service = WebVoiceService(
+                    load_voice_config(self.voice_config_path)
+                )
+            return self._voice_service
+
+    def voice_status(self) -> dict[str, Any]:
+        try:
+            from cat_assistant.voice.web import voice_status
+        except ImportError as exc:
+            return {"available": False, "error": str(exc)}
+        try:
+            return voice_status(load_voice_config(self.voice_config_path))
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+
+    def voice_transcribe(self, pcm: bytes, sample_rate: int) -> str:
+        service = self._voice()
+        return asyncio.run(service.transcribe(pcm, sample_rate))
+
+    def voice_speak(self, text: str) -> bytes:
+        service = self._voice()
+        return asyncio.run(service.speak_wav(text))
+
+    def voice_speak_stream(self, text: str) -> tuple[Iterator[bytes], int]:
+        """返回流式 PCM 与播放采样率；首块到达即可开始播放。"""
+
+        service = self._voice()
+        chunks: queue.Queue[Any] = queue.Queue()
+        cancelled = threading.Event()
+
+        async def produce() -> None:
+            try:
+                async for chunk in service.stream_pcm(text):
+                    if cancelled.is_set():
+                        break
+                    chunks.put(chunk)
+            except BaseException as exc:  # noqa: BLE001 - 转交给 HTTP 线程
+                chunks.put(exc)
+            finally:
+                chunks.put(_VOICE_STREAM_END)
+
+        def worker() -> None:
+            try:
+                asyncio.run(produce())
+            except BaseException as exc:  # noqa: BLE001
+                chunks.put(exc)
+                chunks.put(_VOICE_STREAM_END)
+
+        def iterate() -> Iterator[bytes]:
+            try:
+                while True:
+                    item = chunks.get()
+                    if item is _VOICE_STREAM_END:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+            finally:
+                # 客户端断开时停止继续合成，并让异步生成器尽快关闭上游连接。
+                cancelled.set()
+
+        threading.Thread(
+            target=worker, name="cat-tts-stream", daemon=True
+        ).start()
+        return iterate(), service.config.audio.output_sample_rate
+
     def remember(self, payload: dict[str, Any]) -> dict[str, Any]:
         memory = MemoryRecord(
             content=str(payload.get("content", "")).strip(),
@@ -214,22 +319,72 @@ class DebugRuntime:
         return config
 
     def save_model_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Save into the active profile (the v1 single-model contract)."""
+        return self.save_model_profile(payload, activate=True)
+
+    def save_model_profile(
+        self, payload: dict[str, Any], *, activate: bool | None = None
+    ) -> dict[str, Any]:
+        """Create or update one model profile.
+
+        Only a change to the profile the runtime is *using* needs the app
+        rebuilt, so editing an inactive profile is a plain write. ``activate``
+        forces the saved profile live; by default it goes live only if it
+        already was."""
+        snapshot = self.config_store.snapshot()
+        wanted = str(payload.get("id") or "").strip()
+        if activate is None:
+            activate = bool(wanted) and wanted == snapshot["active_model_id"]
+        model = self.config_store.upsert_model(payload)
+        if not activate:
+            return {"ok": True, "model": model, "configuration": self.configuration()}
+        return self._apply_model(
+            lambda: self.config_store.activate_model(model["id"]),
+            snapshot,
+            model=model,
+        )
+
+    def activate_model_profile(self, item_id: str) -> dict[str, Any]:
+        snapshot = self.config_store.snapshot()
+        return self._apply_model(
+            lambda: self.config_store.activate_model(str(item_id)), snapshot
+        )
+
+    def delete_model_profile(self, item_id: str) -> dict[str, Any]:
+        snapshot = self.config_store.snapshot()
+        active = str(item_id) == snapshot["active_model_id"]
+        result = self.config_store.delete_model(str(item_id))
+        if not active:
+            return {"ok": True, "model": result, "configuration": self.configuration()}
+        # Deleting the live profile promotes another one, so the app has to
+        # follow it over.
+        return self._apply_model(lambda: result, snapshot)
+
+    def _apply_model(
+        self,
+        mutate: Callable[[], dict[str, Any]],
+        snapshot: dict[str, Any],
+        *,
+        model: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         # Apply the new model without a process restart: persist, then rebuild the
         # app from the persisted config and swap it in. If the rebuild/startup
         # fails (e.g. an invalid provider config), restore the last good config
         # and keep the current app serving, so a bad save neither takes the
         # console down nor leaves an unbuildable file for the next restart.
-        previous = self.config_store.snapshot()["model"]
-        model = self.config_store.save_model(payload)
+        applied = mutate()
         try:
             self._reload_app()
         except Exception:
-            self.config_store.save_model(previous)
+            self.config_store.restore_models(
+                snapshot["models"], snapshot["active_model_id"]
+            )
             raise
         return {
             "ok": True,
-            "model": model,
+            "model": model or applied,
             "model_adapter": self.app.model_adapter_name,
+            "configuration": self.configuration(),
         }
 
     def _reload_app(self) -> None:
@@ -240,6 +395,7 @@ class DebugRuntime:
             config_path=self.config_path,
             simulation_scenario=self.simulation_scenario,
             simulation_phase=self.simulation_phase,
+            live_fleet=self.live_fleet,
         )
         self.call(lambda: self._swap_app(new_app))
 
@@ -304,7 +460,7 @@ class DebugHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/state":
             query = self._query()
-            machine_id = query.get("machine_id", "cat-306-demo")
+            machine_id = query.get("machine_id", "")
             session_id = query.get("session_id", "debug-session")
             operator_id = query.get("operator_id", "debug-operator")
             try:
@@ -327,6 +483,9 @@ class DebugHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/config":
             self._json(HTTPStatus.OK, self.runtime.configuration())
             return
+        if parsed.path == "/api/voice/status":
+            self._json(HTTPStatus.OK, self.runtime.voice_status())
+            return
 
         relative = "index.html" if parsed.path in {"", "/"} else parsed.path.lstrip("/")
         target = (UI_ROOT / relative).resolve()
@@ -337,6 +496,8 @@ class DebugHandler(BaseHTTPRequestHandler):
             ".html": "text/html; charset=utf-8",
             ".css": "text/css; charset=utf-8",
             ".js": "text/javascript; charset=utf-8",
+            ".woff2": "font/woff2",
+            ".woff": "font/woff",
         }.get(target.suffix, "application/octet-stream")
         try:
             self._send(HTTPStatus.OK, target.read_bytes(), content_type)
@@ -356,8 +517,100 @@ class DebugHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return payload
 
-    def do_POST(self) -> None:  # noqa: N802
+    def _read_body(self, limit: int) -> bytes:
+        raw_length = self.headers.get("Content-Length", "0")
         try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("invalid content length") from exc
+        if length <= 0 or length > limit:
+            raise ValueError("录音数据为空或过大")
+        return self.rfile.read(length)
+
+    def _handle_voice(self, parsed) -> None:
+        """网页按键录音：整段转写与整段合成，不走本地唤醒/VAD。"""
+
+        if parsed.path == "/api/voice/transcribe":
+            query = self._query()
+            raw_rate = (
+                query.get("sample_rate")
+                or self.headers.get("X-Sample-Rate")
+                or "16000"
+            )
+            try:
+                sample_rate = int(raw_rate)
+            except ValueError as exc:
+                raise ValueError("sample_rate 无效") from exc
+            pcm = self._read_body(8_000_000)
+            try:
+                text = self.runtime.voice_transcribe(pcm, sample_rate)
+            except RuntimeError as exc:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+                return
+            self._json(HTTPStatus.OK, {"text": text})
+            return
+        if parsed.path in {"/api/voice/speak", "/api/voice/speak/stream"}:
+            payload = self._read_json()
+            text = str(payload.get("text", "")).strip()
+            if not text or len(text) > 4_000:
+                raise ValueError("text 必须为 1-4000 个字符")
+            if parsed.path.endswith("/stream"):
+                self._stream_voice_pcm(text)
+                return
+            try:
+                wav = self.runtime.voice_speak(text)
+            except RuntimeError as exc:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+                return
+            if not wav:
+                raise ValueError("TTS 返回空音频")
+            self._send(HTTPStatus.OK, wav, "audio/wav")
+            return
+        self._error(HTTPStatus.NOT_FOUND, "not found")
+
+    def _stream_voice_pcm(self, text: str) -> None:
+        """以裸 PCM 流式返回 TTS；HTTP/1.0 用连接关闭作为流结束。"""
+
+        stream, sample_rate = self.runtime.voice_speak_stream(text)
+        try:
+            first = next(stream)
+        except StopIteration as exc:
+            stream.close()
+            raise ValueError("TTS 返回空音频") from exc
+        except RuntimeError as exc:
+            stream.close()
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+            return
+
+        self.close_connection = True
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "audio/pcm")
+        self.send_header("X-Sample-Rate", str(sample_rate))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(first)
+            self.wfile.flush()
+            for chunk in stream:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            # 响应头已经发出，不能在同一个连接上再写 JSON 错误；直接断开，
+            # 浏览器会停止播放已收到的音频。
+            pass
+        finally:
+            stream.close()
+
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path.startswith("/api/voice/"):
+                self._handle_voice(parsed)
+                return
             payload = self._read_json()
             if self.path == "/api/turn":
                 text = str(payload.get("text", "")).strip()
@@ -366,7 +619,7 @@ class DebugHandler(BaseHTTPRequestHandler):
                 result = self.runtime.turn(
                     text=text,
                     session_id=str(payload.get("session_id", "debug-session")),
-                    machine_id=str(payload.get("machine_id", "cat-306-demo")),
+                    machine_id=str(payload.get("machine_id", "")),
                     operator_id=str(payload.get("operator_id", "debug-operator")),
                 )
                 self._json(HTTPStatus.OK, result)
@@ -382,6 +635,21 @@ class DebugHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/config/model":
                 self._json(HTTPStatus.OK, self.runtime.save_model_config(payload))
+                return
+            if self.path == "/api/config/model/save":
+                self._json(HTTPStatus.OK, self.runtime.save_model_profile(payload))
+                return
+            if self.path == "/api/config/model/activate":
+                self._json(
+                    HTTPStatus.OK,
+                    self.runtime.activate_model_profile(str(payload.get("id", ""))),
+                )
+                return
+            if self.path == "/api/config/model/delete":
+                self._json(
+                    HTTPStatus.OK,
+                    self.runtime.delete_model_profile(str(payload.get("id", ""))),
+                )
                 return
             if self.path == "/api/config/mcp":
                 self._json(HTTPStatus.OK, self.runtime.save_mcp_config(payload))
@@ -409,12 +677,17 @@ def create_server(
     config_path: Path | None = None,
     simulation_scenario: str | None = None,
     simulation_phase: int = 0,
+    voice_config_path: Path | None = None,
 ):
     runtime = DebugRuntime(
         event_path or Path("runtime/debug-events.jsonl"),
         config_path=config_path,
+        voice_config_path=voice_config_path,
         simulation_scenario=simulation_scenario,
         simulation_phase=simulation_phase,
+        # A live server shows the fleet "breathing": faults reshuffle every 10
+        # minutes. Scenario mode ignores this (it replays a scripted timeline).
+        live_fleet=True,
     )
 
     class Handler(DebugHandler):
@@ -434,6 +707,12 @@ def main() -> None:
     parser.add_argument("--event-path", type=Path, default=Path("runtime/debug-events.jsonl"))
     parser.add_argument("--config-path", type=Path, default=Path("runtime/runtime-config.json"))
     parser.add_argument(
+        "--voice-config-path",
+        type=Path,
+        default=Path("runtime/voice-config.json"),
+        help="语音 ASR/TTS 配置（网页录音使用）",
+    )
+    parser.add_argument(
         "--scenario",
         choices=tuple(simulation_catalog()),
         help="run a deterministic multi-stage equipment simulation",
@@ -443,6 +722,7 @@ def main() -> None:
     server = create_server(
         args.host, args.port, args.event_path, args.config_path,
         simulation_scenario=args.scenario, simulation_phase=args.phase,
+        voice_config_path=args.voice_config_path,
     )
     print(f"Cat Assistant debug UI: http://{args.host}:{args.port}/")
     try:

@@ -14,13 +14,46 @@ from cat_assistant.domain.capabilities import (
 )
 from cat_assistant.domain.models import MachineSnapshot, ToolSpec, Utterance
 from cat_assistant.domain.plans import TaskStep
+from cat_assistant.domain.ports import MachineTelemetryPort
 
 
 @dataclass(slots=True)
 class CapabilityExecutionContext:
+    """Shared state for the steps of one plan execution.
+
+    ``machine`` is the snapshot read when the turn started.  Steps that need a
+    current reading call :meth:`current_machine`, which re-reads the telemetry
+    port when one was wired in; after ``machine.control`` the executor also
+    refreshes the cached snapshot, so later steps (notably verification) see
+    the state the action actually produced instead of the turn-start one.
+    """
+
     utterance: Utterance
     machine: MachineSnapshot
+    telemetry: MachineTelemetryPort | None = None
     artifacts: dict[str, tuple[Artifact, ...]] = field(default_factory=dict)
+
+    async def current_machine(self) -> MachineSnapshot:
+        await self.refresh_machine()
+        return self.machine
+
+    async def refresh_machine(self) -> bool:
+        """Re-read telemetry, returning False when no live read was possible.
+
+        Callers that must distinguish a fresh reading from the last cached
+        snapshot (notably post-action verification) use the return value.
+        """
+        if self.telemetry is None:
+            return False
+        try:
+            self.machine = await self.telemetry.get_snapshot(self.machine.machine_id)
+        except Exception:  # noqa: BLE001 - keep the last known snapshot
+            return False
+        return True
+
+    def update_machine(self, machine: MachineSnapshot | None) -> None:
+        if machine is not None:
+            self.machine = machine
 
     def dependency_artifacts(self, step: TaskStep) -> tuple[Artifact, ...]:
         return tuple(
@@ -123,6 +156,14 @@ class CapabilityRegistry:
             for entry in self._entries.values()
             if entry.enabled
         )
+
+    def first_enabled_of_kind(self, kind: str) -> CapabilityDescriptor | None:
+        """First enabled capability of a kind, for deterministic pipeline wiring
+        (e.g. appending the verification step after an actuation)."""
+        for descriptor in self.enabled_descriptors:
+            if descriptor.kind == kind:
+                return descriptor
+        return None
 
     @property
     def model_tools(self) -> tuple[ToolSpec, ...]:

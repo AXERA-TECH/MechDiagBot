@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import replace
 
-from cat_assistant.adapters.memory import InMemoryMemoryStore, InMemorySessionStore
 from cat_assistant.application.events import EventRecorder
 from cat_assistant.application.orchestration import TaskOrchestrator
 from cat_assistant.application.tracing import NoOpTracer, bind, unbind
@@ -30,8 +30,8 @@ class AgentLoop:
         telemetry: MachineTelemetryPort,
         orchestrator: TaskOrchestrator,
         events: EventRecorder,
-        session_store: SessionStorePort | None = None,
-        memory: MemoryPort | None = None,
+        session_store: SessionStorePort,
+        memory: MemoryPort,
         turn_timeout_seconds: float = 120.0,
         tracer: Tracer | None = None,
     ) -> None:
@@ -40,8 +40,10 @@ class AgentLoop:
         self._telemetry = telemetry
         self._orchestrator = orchestrator
         self._events = events
-        self._session_store = session_store or InMemorySessionStore()
-        self._memory = memory or InMemoryMemoryStore()
+        # The loop is application-layer code: stores are injected ports, never
+        # imported adapters. The composition root chooses the concrete backend.
+        self._session_store = session_store
+        self._memory = memory
         self._turn_timeout_seconds = turn_timeout_seconds
         self._tracer = tracer or NoOpTracer()
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -107,6 +109,11 @@ class AgentLoop:
         """
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
+        # An approval that outlived its conversation must not become executable
+        # through a later confirmation in the same session.
+        await self._orchestrator.cancel_pending(
+            session_id, reason="session_cleared"
+        )
         removed = await self._session_store.delete_session(session_id)
         await self._events.record(
             "session/cleared",
@@ -199,11 +206,36 @@ class AgentLoop:
         await self.startup()
         return await self._handle_turn(utterance)
 
+    async def _general_response(self, utterance: Utterance) -> AssistantResponse:
+        """Answer without device telemetry, tools or actuation.
+
+        Composition roots expose ``BoundedAgentRunner`` on ``self.runner``; when
+        an embedder provides only an orchestrator, general turns fail closed with
+        a clear explanation instead of touching device ports with an empty id.
+        """
+        run_general = getattr(self.runner, "run_general", None)
+        if run_general is None:
+            return AssistantResponse(
+                "当前尚未接入设备，通用问答暂不可用。请先从左侧设备列表接入设备。",
+                ResponseCategory.INFORMATION,
+                metadata={"reason": "general_chat_unavailable", "machine_attached": False},
+            )
+        return await run_general(
+            session_id=utterance.session_id,
+            user_text=utterance.text,
+            operator_id=utterance.operator_id,
+        )
+
     async def _handle_turn(self, utterance: Utterance) -> AssistantResponse:
+        # An empty machine id means the console has no device attached. Normalise
+        # whitespace so every downstream record uses the same general-lane key.
+        machine_id = (utterance.machine_id or "").strip()
+        if utterance.machine_id != machine_id:
+            utterance = replace(utterance, machine_id=machine_id)
         await self._events.record(
             "turn/started",
             utterance.session_id,
-            machine_id=utterance.machine_id,
+            machine_id=machine_id,
             operator_id=utterance.operator_id,
         )
         await self._events.record(
@@ -218,13 +250,16 @@ class AgentLoop:
             session_id=utterance.session_id,
             user_id=utterance.operator_id,
             input=utterance.text,
-            metadata={"machine_id": utterance.machine_id},
+            metadata={"machine_id": machine_id},
         )
         token = bind(trace)
         response: AssistantResponse | None = None
         try:
-            machine = await self._telemetry.get_snapshot(utterance.machine_id)
-            response = await self._orchestrator.handle(utterance, machine)
+            if machine_id:
+                machine = await self._telemetry.get_snapshot(machine_id)
+                response = await self._orchestrator.handle(utterance, machine)
+            else:
+                response = await self._general_response(utterance)
 
             await self._events.record(
                 "assistant/response",
@@ -237,7 +272,7 @@ class AgentLoop:
                 await self._session_store.append_turn(
                     TurnRecord(
                         session_id=utterance.session_id,
-                        machine_id=utterance.machine_id,
+                        machine_id=machine_id,
                         user_text=utterance.text,
                         assistant_text=response.text,
                         category=response.category.value,

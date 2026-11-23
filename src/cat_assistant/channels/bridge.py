@@ -3,21 +3,21 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from cat_assistant.application.loop import AgentLoop
 from cat_assistant.channels.base import ChannelMessage, MessageChannel
 from cat_assistant.domain.models import Utterance
+from cat_assistant.domain.ports import AgentHandlePort
 
 log = logging.getLogger(__name__)
 
 
 class ChannelBridge:
-    """Connect a channel to ``AgentLoop`` with stable session scoping.
+    """Connect a channel to the agent loop with stable session scoping.
 
     ``machine_id`` can be a fixed device or a resolver for multi-device chats.
     The sender id is used as operator id so history cannot leak between users.
     """
 
-    def __init__(self, app: AgentLoop, *, machine_id: str | Callable[[ChannelMessage], str]):
+    def __init__(self, app: AgentHandlePort, *, machine_id: str | Callable[[ChannelMessage], str]):
         self.app = app
         self.machine_id = machine_id
 

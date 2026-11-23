@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -13,13 +15,72 @@ from cat_assistant.domain.capabilities import (
     CapabilityDescriptor,
     CapabilityResult,
 )
-from cat_assistant.domain.models import ChatMessage
+from cat_assistant.domain.models import ChatMessage, KnowledgeHit, MachineSnapshot
 from cat_assistant.domain.plans import TaskStep
 from cat_assistant.domain.ports import KnowledgePort, MachineControlPort
 
 
 EMPTY_INPUT = {"type": "object", "properties": {}, "additionalProperties": False}
 ARTIFACT_OUTPUT = {"type": "object"}
+
+_FAULT_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z]\d{2,5})(?![A-Za-z0-9])", re.IGNORECASE
+)
+_CURRENT_FOCUS_MARKERS = (
+    "当前",
+    "目前",
+    "现在",
+    "本机",
+    "这台",
+    "本设备",
+    "现状",
+    "什么问题",
+    "哪些问题",
+    "存在哪些",
+    "这个故障",
+    "该故障",
+    "这个问题",
+    "该问题",
+    "这个码",
+    "该码",
+    "这个异常",
+    "该异常",
+    "这个报警",
+    "该报警",
+    "需要如何",
+)
+
+
+def _fault_codes_in(text: str) -> set[str]:
+    return {match.group(1).casefold() for match in _FAULT_CODE_RE.finditer(text)}
+
+
+def _scope_current_fault_hits(
+    hits: Sequence[KnowledgeHit],
+    machine: MachineSnapshot,
+    query: str,
+) -> tuple[KnowledgeHit, ...]:
+    """Keep a current-fault lookup focused on the codes the machine reports.
+
+    Same-model manuals for other fault codes rank highly in the demo index and
+    otherwise make the model discuss (and cite) a fault that is not present.
+    Only current-status questions are scoped; asking directly about another code
+    still retrieves that code's manual.
+    """
+    active = {code.casefold() for code in machine.fault_codes}
+    if not active or not any(marker in query for marker in _CURRENT_FOCUS_MARKERS):
+        return tuple(hits)
+    focus = active | _fault_codes_in(query)
+    kept: list[KnowledgeHit] = []
+    generic: list[KnowledgeHit] = []
+    for hit in hits:
+        codes = _fault_codes_in(f"{hit.content} {hit.source}")
+        if not codes:
+            generic.append(hit)
+            kept.append(hit)
+        elif codes & focus:
+            kept.append(hit)
+    return tuple(kept or generic or hits[:1])
 
 
 class TelemetryReadProvider:
@@ -44,7 +105,7 @@ class TelemetryReadProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del arguments, step
-        snapshot = context.machine
+        snapshot = await context.current_machine()
         data = {
             "machine_id": snapshot.machine_id,
             "model": snapshot.model,
@@ -91,11 +152,12 @@ class TelemetrySummaryProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del arguments, step
-        faults = "、".join(context.machine.fault_codes) if context.machine.fault_codes else "无活动故障码"
+        machine = await context.current_machine()
+        faults = "、".join(machine.fault_codes) if machine.fault_codes else "无活动故障码"
         text = (
-            f"{context.machine.model} 当前状态：{context.machine.operating_state}，"
-            f"发动机{'运行中' if context.machine.engine_running else '已停止'}，"
-            f"燃油 {context.machine.fuel_percent:.0f}%，故障码：{faults}。"
+            f"{machine.model} 当前状态：{machine.operating_state}，"
+            f"发动机{'运行中' if machine.engine_running else '已停止'}，"
+            f"燃油 {machine.fuel_percent:.0f}%，故障码：{faults}。"
         )
         return CapabilityResult(
             content=text,
@@ -194,7 +256,9 @@ class KnowledgeSearchProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del step
-        hits = await self.knowledge.search(str(arguments["query"]), machine=context.machine)
+        machine = await context.current_machine()
+        hits = await self.knowledge.search(str(arguments["query"]), machine=machine)
+        hits = _scope_current_fault_hits(hits, machine, str(arguments["query"]))
         data = [
             {
                 "content": hit.content,
@@ -211,7 +275,7 @@ class KnowledgeSearchProvider:
                     data,
                     self.descriptor.name,
                     confidence=max((hit.score for hit in hits), default=0.0),
-                    provenance={"machine_model": context.machine.model},
+                    provenance={"machine_model": machine.model},
                 ),
             )
         )
@@ -249,12 +313,47 @@ class DeterministicResponseProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del step
-        response = await self.query_service.answer(str(arguments["text"]), context.machine)
+        machine = await context.current_machine()
+        response = await self.query_service.answer(str(arguments["text"]), machine)
         return CapabilityResult(
             content=response.text,
             response_category=response.category.value,
             artifacts=(Artifact("assistant_response", {"text": response.text}, self.descriptor.name),),
         )
+
+
+def _format_diagnosis(text: str, source_line: str | None) -> str:
+    """Normalise a diagnosis reply: drop model-written 来源 citations, then append
+    a single canonical citation when manual evidence was retrieved.
+
+    Small edge models cite unreliably — repeating the “来源：” prefix on every
+    line, gluing the citation mid-sentence onto the 建议 text, or naming a manual
+    from a different device. Rather than coax the format out of the model, the
+    caller builds the citation deterministically from the (already device-scoped)
+    retrieved hits and passes it as ``source_line``; here we remove whatever
+    citation the model wrote — whether it leads a line or is glued onto the end
+    of a sentence — and re-attach that one clean line, so the operator always
+    sees a correct, de-duplicated 来源. ``source_line`` is None when the turn did
+    no retrieval — then no citation is shown and any stray model citation is
+    still removed (never leave an ungrounded 来源 in the reply).
+    """
+
+    def _strip_citation(line: str) -> str:
+        cuts = [idx for idx in (line.find("来源："), line.find("来源:")) if idx != -1]
+        return line[: min(cuts)].rstrip() if cuts else line
+
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = _strip_citation(line)
+        # A line that was *only* a citation collapses to empty — drop it rather
+        # than leave a blank hole; a genuinely blank separator line is preserved.
+        if not stripped and line.strip():
+            continue
+        kept.append(stripped)
+    body = "\n".join(kept).strip()
+    if not source_line:
+        return body
+    return f"{body}\n\n{source_line}" if body else source_line
 
 
 @dataclass
@@ -300,11 +399,12 @@ class DiagnosticAgentProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del arguments
+        machine = await context.current_machine()
         messages = list(
             await self.context_builder.build(
                 session_id=context.utterance.session_id,
                 user_text=context.utterance.text,
-                machine=context.machine,
+                machine=machine,
                 operator_id=context.utterance.operator_id,
             )
         )
@@ -326,8 +426,8 @@ class DiagnosticAgentProvider:
                 ChatMessage(
                     role="system",
                     content=(
-                        "Operator-reported observations are non-authoritative and must be "
-                        "confirmed before a high-confidence conclusion: "
+                        "以下为操作员口述的观察，属非权威信息，下结论前需先核实，"
+                        "不能据此直接给出高置信度判断："
                         + json.dumps([artifact.data for artifact in reported], ensure_ascii=False)
                     ),
                 )
@@ -336,40 +436,66 @@ class DiagnosticAgentProvider:
             (artifact for artifact in evidence if artifact.artifact_type == "knowledge_evidence"),
             None,
         )
+        # The citation is built deterministically from the retrieved hits (below),
+        # not written by the model: small edge models duplicate the "来源：" prefix,
+        # run the citation onto the 建议 sentence, or name a manual from another
+        # device. None means the turn did no retrieval, so no citation is shown.
+        source_line: str | None = None
         if knowledge is not None:
-            payload = json.dumps(knowledge.data, ensure_ascii=False)
+            # Bound the spliced evidence so a small-context edge model (~2K
+            # tokens) cannot overflow: keep only the top few ranked hits (best
+            # first from knowledge.search), expose just the content + source the
+            # answer needs, and cap each snippet. score/document_version are
+            # internal ranking fields — noise for the model and extra tokens.
+            hits = knowledge.data if isinstance(knowledge.data, list) else []
+            bounded = [
+                {
+                    "content": str(hit.get("content", ""))[:500],
+                    "source": hit.get("source", ""),
+                }
+                for hit in hits[:3]
+                if isinstance(hit, dict)
+            ]
+            payload = json.dumps(bounded, ensure_ascii=False)
             messages.append(
                 ChatMessage(
                     role="system",
                     content=(
-                        "Collected knowledge evidence from the knowledge.search "
-                        "capability. This is trusted task evidence, not a tool-call "
-                        "message. Cite its sources and do not claim that you performed "
-                        "another search unless you actually do so:\n"
+                        "以下为检索到的手册证据：请据此作答，不要声称做过未执行的检索；"
+                        "无需自行书写来源，系统会据此自动附注。\n"
                         + payload
                     ),
                 )
             )
+            # De-duplicated, order-preserving citation built from the (already
+            # device-scoped) sources actually shown to the model.
+            sources: list[str] = []
+            for hit in bounded:
+                src = hit["source"]
+                if src and src not in sources:
+                    sources.append(src)
+            source_line = "来源：" + "；".join(sources) if sources else "来源：未检索到"
         messages.append(user_turn)
         response = await self.runner.run(
             session_id=context.utterance.session_id,
             user_text=context.utterance.text,
-            machine=context.machine,
+            machine=machine,
             operator_id=context.utterance.operator_id,
             initial_messages=messages,
         )
+        text = _format_diagnosis(response.text, source_line)
         return CapabilityResult(
             status=(
                 "failed"
                 if response.category.value == "error"
                 else "completed"
             ),
-            content=response.text,
+            content=text,
             response_category=response.category.value,
             artifacts=(
                 Artifact(
                     "diagnostic_assessment",
-                    {"text": response.text, "evidence_ids": [item.artifact_id for item in evidence]},
+                    {"text": text, "evidence_ids": [item.artifact_id for item in evidence]},
                     self.descriptor.name,
                     provenance={"bounded": True},
                 ),
@@ -404,10 +530,18 @@ class ActionProposalProvider:
         step: TaskStep,
     ) -> CapabilityResult:
         del step
-        faults = ", ".join(context.machine.fault_codes) or "未发现活动故障码"
+        machine = await context.current_machine()
+        faults = ", ".join(machine.fault_codes) or "未发现活动故障码"
+        # 发动机仍在运行时，动手处置前的安全前提通常是先停机熄火（如 E45 冷却系统需
+        # 停机冷却后检查）；已停机则只需确认安全工况，不重复要求停机。
+        safe_state = (
+            "先将设备停机熄火并置于安全工况"
+            if machine.engine_running
+            else "先确认设备处于安全工况"
+        )
         text = (
-            f"建议执行方案：先确认设备处于安全工况（当前：{context.machine.operating_state}），"
-            f"核对故障码 {faults}，再由授权操作员执行请求：{arguments['request']}。"
+            f"建议执行方案：{safe_state}（当前：{machine.operating_state}），"
+            f"核对故障码 {faults}，相关处置动作须由授权操作员确认后执行。"
         )
         return CapabilityResult(
             content=text,
@@ -456,9 +590,11 @@ class MachineControlProvider:
                 content="当前没有接入受安全网关保护的设备控制执行器。",
             )
         request = arguments["request"]
-        outcome = await self._executor.apply(request, machine=context.machine)
+        machine = await context.current_machine()
+        outcome = await self._executor.apply(request, machine=machine)
         if not outcome.accepted:
             return CapabilityResult(status="denied", content=outcome.summary)
+        context.update_machine(outcome.machine)
         data: dict[str, Any] = {"request": request, "summary": outcome.summary}
         if outcome.machine is not None:
             data["operating_state"] = outcome.machine.operating_state
@@ -467,6 +603,117 @@ class MachineControlProvider:
             status="completed",
             content=outcome.summary,
             artifacts=(Artifact("action_result", data, self.descriptor.name),),
+        )
+
+
+class VerificationProvider:
+    """Re-read telemetry after actuation and compare it with the action result.
+
+    Verification is a first-class pipeline step (``kind="verify"``) rather than
+    prose appended to the actuator: it runs only after the approved action, uses
+    a live telemetry read, and can therefore detect the difference between "the
+    gateway accepted the command" and "the machine actually changed state".
+    """
+
+    descriptor = CapabilityDescriptor(
+        name="verify.state",
+        version="1.0.0",
+        description="动作执行后重新读取遥测，复核设备状态是否达到动作预期。",
+        input_schema=EMPTY_INPUT,
+        output_schema=ARTIFACT_OUTPUT,
+        kind="verify",
+        source="telemetry",
+        consumes=("action_result",),
+        produces=("verification_report",),
+        visible_in_response=True,
+        model_selectable=False,
+    )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: CapabilityExecutionContext,
+        step: TaskStep,
+    ) -> CapabilityResult:
+        del arguments
+        live_read = await context.refresh_machine()
+        machine = context.machine
+        evidence = [
+            artifact
+            for artifact in context.dependency_artifacts(step)
+            if artifact.artifact_type == "action_result"
+        ]
+        if not evidence:
+            # Some plans attach verification to the proposal or to a sibling
+            # branch; any action result from this plan is still the right reference.
+            evidence = list(context.artifacts_of_type("action_result"))
+        expected_state: str | None = None
+        expected_running: bool | None = None
+        for artifact in evidence:
+            data = artifact.data if isinstance(artifact.data, dict) else {}
+            if isinstance(data.get("operating_state"), str):
+                expected_state = data["operating_state"]
+            if isinstance(data.get("engine_running"), bool):
+                expected_running = data["engine_running"]
+        comparisons = expected_running is not None or expected_state is not None
+        matched = True
+        checks: list[str] = []
+        if not live_read:
+            checks.append("无法读取动作后的实时遥测，当前显示最后一次已知状态")
+        if expected_running is not None:
+            agrees = machine.engine_running is expected_running
+            matched = matched and agrees
+            checks.append(
+                f"发动机{'运行中' if machine.engine_running else '已停止'}，"
+                f"预期{'运行' if expected_running else '停止'}，"
+                + ("一致" if agrees else "不一致")
+            )
+        if expected_state is not None:
+            agrees = machine.operating_state == expected_state
+            matched = matched and agrees
+            checks.append(
+                f"运行状态「{machine.operating_state}」，预期「{expected_state}」，"
+                + ("一致" if agrees else "不一致")
+            )
+        if not comparisons:
+            checks.append("动作未声明可核对的遥测字段，以下为执行后的读数")
+        faults = "、".join(machine.fault_codes) if machine.fault_codes else "无"
+        checks.append(f"故障码：{faults}")
+        checks.append(f"观测时间：{machine.captured_at.isoformat()}")
+        if not live_read:
+            verdict = "复核结果：无法读取动作后的实时遥测，请人工确认设备状态。"
+        elif not comparisons:
+            verdict = "复核结果：已完成动作后的状态读取（该动作未声明可核对的字段）。"
+        elif matched:
+            verdict = "复核结果：动作已生效。"
+        else:
+            verdict = "复核结果：实时读数与动作预期不一致，请人工检查设备。"
+        text = verdict + "；".join(checks) + "。"
+        return CapabilityResult(
+            content=text,
+            artifacts=(
+                Artifact(
+                    "verification_report",
+                    {
+                        "matched": matched if live_read and comparisons else None,
+                        "live_read": live_read,
+                        "expected": {
+                            "operating_state": expected_state,
+                            "engine_running": expected_running,
+                        },
+                        "observed": {
+                            "operating_state": machine.operating_state,
+                            "engine_running": machine.engine_running,
+                            "fault_codes": list(machine.fault_codes),
+                            "captured_at": machine.captured_at.isoformat(),
+                        },
+                        "text": text,
+                    },
+                    self.descriptor.name,
+                    provenance={"authority": "machine_telemetry"},
+                ),
+            ),
+            metadata={"matched": matched if live_read and comparisons else None},
         )
 
 
@@ -490,4 +737,5 @@ def builtin_capability_providers(
         ),
         ActionProposalProvider(),
         MachineControlProvider(machine_control),
+        VerificationProvider(),
     )

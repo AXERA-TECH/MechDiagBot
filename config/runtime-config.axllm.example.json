@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "active_model_id": "axllm-qwen3-4b",
+  "models": [
+    {
+      "id": "axllm-qwen3-4b",
+      "name": "AXLLM Qwen3-4B",
+      "provider": "axllm",
+      "model": "Qwen3-4B",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key_env": "",
+      "temperature": 0.1,
+      "max_tokens": 1024,
+      "timeout_seconds": 60,
+      "max_steps": 4,
+      "planning_mode": "rule",
+      "disable_thinking": true,
+      "stop": ["<|im_end|>", "<|im_start|>"],
+      "model_call_timeout_seconds": 90,
+      "tool_call_timeout_seconds": 30,
+      "turn_timeout_seconds": 120
+    }
+  ],
+  "mcp_servers": [],
+  "plugins": []
+}

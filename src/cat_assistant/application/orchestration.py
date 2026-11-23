@@ -4,15 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from cat_assistant.application import tracing
+from cat_assistant.application.approvals import (
+    ConfirmationKind,
+    PendingApproval,
+    is_standalone_cancel,
+    is_standalone_confirmation,
+    machine_signature,
+    parse_confirmation,
+    plan_digest,
+)
 from cat_assistant.application.capabilities import (
     CapabilityExecutionContext,
     CapabilityRegistry,
 )
 from cat_assistant.application.events import EventRecorder
-from cat_assistant.application import tracing
+from cat_assistant.application.intent import has_positive_action, looks_like_question
 from cat_assistant.domain.capabilities import Artifact, CapabilityDescriptor
 from cat_assistant.domain.models import (
     AssistantResponse,
@@ -24,7 +36,7 @@ from cat_assistant.domain.models import (
     Utterance,
 )
 from cat_assistant.domain.plans import StepResult, TaskPlan, TaskStep
-from cat_assistant.domain.ports import LanguageModelPort
+from cat_assistant.domain.ports import LanguageModelPort, MachineTelemetryPort
 
 
 class TaskPlannerPort(Protocol):
@@ -78,7 +90,12 @@ class RuleBasedTaskPlanner:
         "stop",
         "set ",
     )
-    _proposal_words = ("方案", "建议", "步骤", "如何处理", "怎么解决", "给出执行")
+    # Only phrasings that ask for an executable plan trigger action.propose. Pure
+    # advisory questions ("怎么解决"/"如何处理") are already answered in full by the
+    # diagnosis's own 建议 section, and appending the proposal template there just
+    # echoes the question back as a nonsensical "执行请求：<问题>". A real action
+    # request still reaches machine.control via _action_words / explicit_action.
+    _proposal_words = ("方案", "步骤", "给出执行", "给出方案", "处置步骤")
 
     def __init__(self, capabilities: CapabilityRegistry) -> None:
         self._capabilities = capabilities
@@ -88,7 +105,11 @@ class RuleBasedTaskPlanner:
         text = utterance.text.strip()
         lowered = text.casefold()
         needs_knowledge = any(word in lowered for word in self._knowledge_words)
-        explicit_action = any(word in lowered for word in self._action_words)
+        # "执行" inside "不要执行" / "确认一下油量" must not arm the actuator:
+        # require an action word that is not negated and a non-question turn.
+        explicit_action = has_positive_action(lowered, self._action_words)
+        if looks_like_question(lowered):
+            explicit_action = False
         # A read-only request must not accidentally enter the control path just
         # because it contains wording such as “不要执行任何操作”.
         if any(phrase in lowered for phrase in ("只读", "只读检查", "不要执行", "无需执行", "不执行任何操作")):
@@ -236,6 +257,17 @@ class RuleBasedTaskPlanner:
             )
             action_steps.append("act")
         verify_dependencies = action_steps or final_dependencies
+        # Close the loop deterministically: every actuation is followed by a
+        # fresh telemetry verification step, even when the model never planned
+        # one. The provider is found by kind, so it is registered (and can be
+        # replaced) independently of the planner.
+        if action_steps and not discovered_by_kind["verify"]:
+            verify_provider = self._capabilities.first_enabled_of_kind("verify")
+            if verify_provider is not None:
+                steps.append(
+                    TaskStep("verify", verify_provider.name, {}, tuple(verify_dependencies))
+                )
+                verify_dependencies = ["verify"]
         for index, descriptor in enumerate(discovered_by_kind["verify"], start=1):
             step_id = f"verify-dynamic-{index}"
             steps.append(
@@ -311,21 +343,37 @@ class ToolCallingTaskPlanner:
         tools = self._capabilities.model_tools
         if not tools:
             return await self._fallback.build(utterance, machine)
-        # Fast path for bare fact/status questions. The rule planner is pure (no
-        # model call), so run it first: when it would answer the turn with its
-        # deterministic ``response.compose`` branch — e.g. "下次保养时间" or "现在
-        # 什么状态" — an LLM planning pass adds nothing and would only be discarded
-        # as an empty selection, so skip the slow (~10 tok/s) model call and use
-        # the rule plan directly. Anything needing retrieval, diagnosis, a
-        # proposal or an action does not reach that branch and still gets full
-        # LLM planning below.
+        # The rule planner is pure (no model call), so run it first and reuse its
+        # plan on the fast paths below before spending a slow (~10 tok/s) model
+        # call on a turn the LLM can't improve.
         fallback_plan = await self._fallback.build(utterance, machine)
+        # Skip the (slow, edge-constrained) LLM planning call whenever the
+        # deterministic rule plan already fully answers the turn and the LLM
+        # cannot improve it:
+        #  * deterministic_fact — a bare status/fact turn answered by
+        #    response.compose (e.g. "下次保养时间").
+        #  * explicit_control — an explicit actuation command ("停机"/"启动"/…)
+        #    the rule planner already decomposes into the safe
+        #    summarize→propose→machine.control chain. The actuation is
+        #    approval-gated regardless, and the planner only *selects* tools (it
+        #    can't ask for clarification), so an LLM pass adds latency and
+        #    misplan risk with no upside. A compound "诊断+停机" turn still uses
+        #    the model for the diagnosis language via diagnostic.agent — only the
+        #    orchestration is taken from rules ("LLM for language, rules for
+        #    orchestration").
+        # Diagnosis/knowledge turns match neither and still get full LLM planning.
         if _is_deterministic_answer_plan(fallback_plan):
+            fast_reason: str | None = "deterministic_fact"
+        elif any(step.capability == "machine.control" for step in fallback_plan.steps):
+            fast_reason = "explicit_control"
+        else:
+            fast_reason = None
+        if fast_reason is not None:
             if self._events is not None:
                 await self._events.record(
                     "planning/fast_path",
                     utterance.session_id,
-                    reason="deterministic_fact",
+                    reason=fast_reason,
                     steps=[step.capability for step in fallback_plan.steps],
                 )
             return fallback_plan
@@ -405,6 +453,38 @@ class ToolCallingTaskPlanner:
                     depends_on=dependencies,
                 )
             )
+        # Mirror the rule planner's closing step: any model-selected actuation is
+        # followed by a verification capability so the operator learns whether the
+        # action actually took effect. Verification is discovered by kind and is
+        # never one of the model's selectable tools.
+        if any(
+            (descriptor := self._capabilities.descriptor(step.capability)) is not None
+            and descriptor.kind == "act"
+            for step in steps
+        ) and not any(
+            (descriptor := self._capabilities.descriptor(step.capability)) is not None
+            and descriptor.kind == "verify"
+            for step in steps
+        ):
+            verify_provider = self._capabilities.first_enabled_of_kind("verify")
+            if verify_provider is not None:
+                selected = [step.capability for step in steps]
+                steps.append(
+                    TaskStep(
+                        step_id=f"model-{len(steps) + 1}",
+                        capability=verify_provider.name,
+                        arguments={},
+                        depends_on=tuple(step.step_id for step in steps),
+                    )
+                )
+                if self._events is not None:
+                    await self._events.record(
+                        "planning/llm_plan_repaired",
+                        utterance.session_id,
+                        reason="appended_verification",
+                        appended=verify_provider.name,
+                        selected_tools=selected,
+                    )
         # A plan that only gathers evidence (telemetry read / knowledge search)
         # but selects no capability that speaks to the operator would execute
         # successfully yet yield the empty "任务已完成，但没有可展示的结果" reply.
@@ -446,6 +526,53 @@ class ToolCallingTaskPlanner:
             return TaskPlan(
                 steps=tuple(steps),
                 reason="llm tool-call capability selection (terminal answer appended)",
+            )
+        # ``telemetry.summarize`` is operator-visible, so a plan that selects it
+        # (optionally with manual retrieval) passes the check above even though it
+        # never produces a diagnosis. The model does this on follow-up questions
+        # such as "怎么解决这个故障呢": the turn gets a status line and a silent
+        # knowledge artifact, but no answer. When the rule planner determined the
+        # turn needs a diagnosis, append one unless the model already selected a
+        # diagnosis or a proposal. This is the same "LLM for language, rules for
+        # orchestration" split used for actuation: evidence selection stays the
+        # model's, but the operator-facing conclusion cannot be dropped.
+        diagnosis_required = any(
+            step.capability == "diagnostic.agent" for step in fallback_plan.steps
+        )
+        diagnosis_selected = any(
+            step.capability == "diagnostic.agent" for step in steps
+        )
+        proposal_selected = any(
+            (descriptor := self._capabilities.descriptor(step.capability)) is not None
+            and descriptor.kind == "propose"
+            for step in steps
+        )
+        if (
+            diagnosis_required
+            and not diagnosis_selected
+            and not proposal_selected
+            and self._capabilities.is_enabled("diagnostic.agent")
+        ):
+            selected = [step.capability for step in steps]
+            steps.append(
+                TaskStep(
+                    step_id=f"model-{len(steps) + 1}",
+                    capability="diagnostic.agent",
+                    arguments={},
+                    depends_on=tuple(step.step_id for step in steps),
+                )
+            )
+            if self._events is not None:
+                await self._events.record(
+                    "planning/llm_plan_repaired",
+                    utterance.session_id,
+                    reason="appended_diagnosis",
+                    appended="diagnostic.agent",
+                    selected_tools=selected,
+                )
+            return TaskPlan(
+                steps=tuple(steps),
+                reason="llm tool-call capability selection (diagnosis appended)",
             )
         return TaskPlan(
             steps=tuple(steps),
@@ -569,6 +696,7 @@ class ToolCallingTaskPlanner:
             descriptor
             for descriptor in self._capabilities.enabled_descriptors
             if descriptor.visible_in_response
+            and descriptor.kind not in {"verify"}
             and descriptor.side_effect == "none"
             and not descriptor.requires_approval
             and not (descriptor.input_schema.get("required") or ())
@@ -598,33 +726,22 @@ class ToolCallingTaskPlanner:
             if self._max_steps is not None
             else ""
         )
+        faults = "、".join(machine.fault_codes) if machine.fault_codes else "无"
         return (
-            "你是工业设备助手的任务规划器。你不直接回答用户，而是在这一次回复里"
-            "一次性、按执行顺序选出所有需要的能力工具（通常不止一个），由它们的执行"
-            "结果产生答复。\n"
-            "重要：这是一次性规划，不是分步对话——系统不会把工具结果回传给你，也不会"
-            "再次调用你。因此绝不要“先选一个、等结果再决定下一个”；哪怕你的思路是"
-            "“先读遥测、再查手册、然后诊断”，也必须把这几步在本次一起列出。\n"
-            "规则如下：\n"
-            "1. 必须以“产出答复”的工具收尾。只读遥测或检索手册只是收集证据，不会向"
-            "操作员展示任何内容。任何非空计划都必须包含下列“产出答复”工具之一，并作为"
-            f"最后一步：{answer_list}。要与证据类工具放进同一份计划——它排在证据工具"
-            "之后执行、并自动获得它们的结果，因此你无需先看到证据再选它。\n"
-            "2. 求全不求少：把答复所需的每个能力都选上，但不要选冗余的；不要只收集"
-            "证据就停下。\n"
-            "3. 遇到“有什么故障/问题”或“怎么处理/怎么修”类问题，本次计划至少要同时"
-            "包含“检索手册”和“运行诊断”两个工具，不要只做其中一步就停；当用户要求"
-            "动手处理或执行时，再加上动作建议工具。设备当前状态（型号、故障码等）已在"
-            "下方给出，无需专门去读取。\n"
-            "4. 优先只读诊断与方案建议。仅当用户明确要求执行某项改变设备状态的操作时，"
-            "才选择会改变状态的能力；该操作仍受策略与操作员审批约束。\n"
-            "5. 仅当用户询问设备当前状况、或在给出某项动作方案之前，才做状态摘要。对于"
-            "问候语或与设备无关的消息，完全不要选择任何工具，好让助手以对话方式回复、"
-            "不带机器状态前言。\n"
-            "6. 参数必须严格符合各工具的 schema；不要臆造工具或参数。\n"
+            "你是工业设备任务规划器，只挑选并排序工具，不直接答复操作员。必须在这一次就按执行"
+            "顺序列出完整计划：系统不会回传中间结果，也不会再次调用你，所以即使打算分步推进，"
+            "也要一次把从取证到结论的每一步都列全，不要只选一个工具就收尾。\n"
+            "设备/故障/维修类问题的标准链条（按序选全，缺一即不完整）：状态摘要→手册检索→诊断"
+            "结论；用户询问解决方法、索取方案或要求处理时，末尾再接行动建议。状态摘要与手册检索属中间取证，"
+            "不能作为唯一步骤单独出现，其后必须跟上诊断或建议这类面向操作员的结论工具。\n"
+            f"规则：1) 非空计划必须以答复工具收尾：{answer_list}；取证工具排在前面。"
+            "2) 故障、异常、报警、维修类问题至少同时包含手册检索与诊断，只给其一即为遗漏。"
+            "3) 涉及设备状态、故障或处置的问题开头先给状态摘要；纯闲聊或与设备无关的问题"
+            "不选任何工具。"
+            "4) 优先只读；改变设备状态须用户明确要求并经操作员审批。"
+            "5) 严格遵守工具 schema，只按定义填参数，不臆造字段。\n"
             + budget
-            + f"当前目标设备：型号={machine.model}，machine_id={machine.machine_id}，"
-            f"状态={machine.operating_state}，故障码={list(machine.fault_codes)}。"
+            + f"设备：{machine.model}/{machine.machine_id}；运行状态={machine.operating_state}；故障码={faults}。"
         )
 
 
@@ -684,10 +801,13 @@ class PlanExecutor:
         registry: CapabilityRegistry,
         policy: PolicyEngine,
         events: EventRecorder,
+        *,
+        telemetry: MachineTelemetryPort | None = None,
     ) -> None:
         self._registry = registry
         self._policy = policy
         self._events = events
+        self._telemetry = telemetry
 
     async def execute(
         self,
@@ -698,7 +818,9 @@ class PlanExecutor:
         approved: bool = False,
     ) -> AssistantResponse:
         self._validate(plan)
-        context = CapabilityExecutionContext(utterance, machine)
+        context = CapabilityExecutionContext(
+            utterance, machine, telemetry=self._telemetry
+        )
         completed: set[str] = set()
         results: list[StepResult] = []
         pending = list(plan.steps)
@@ -909,9 +1031,30 @@ class PlanExecutor:
                 requires_confirmation=True,
                 metadata=metadata,
             )
+        act_completed = approved and any(
+            item.status == "completed"
+            and (descriptor := self._registry.descriptor(item.capability)) is not None
+            and descriptor.kind == "act"
+            for item in results
+        )
         if failed:
             metadata["failed_step"] = failed.step_id
+            # An actuation that already ran is not retracted by a later
+            # verification failure: report the action outcome plus the warning
+            # instead of labelling the whole turn as an error.
+            if act_completed:
+                return AssistantResponse(
+                    visible or "设备动作已执行，但后续复核未完成，请人工检查设备。",
+                    ResponseCategory.ACTION_COMPLETED,
+                    metadata=metadata,
+                )
             return AssistantResponse(failed.content, ResponseCategory.ERROR, metadata=metadata)
+        if act_completed:
+            return AssistantResponse(
+                visible or "设备动作已执行，请查看执行结果。",
+                ResponseCategory.ACTION_COMPLETED,
+                metadata=metadata,
+            )
         category = next(
             (
                 ResponseCategory(item.response_category)
@@ -928,25 +1071,103 @@ class PlanExecutor:
 
 
 class TaskOrchestrator:
-    """Facade used by AgentLoop; it has no fixed intent-lane branch."""
+    """Facade used by AgentLoop; it has no fixed intent-lane branch.
 
-    def __init__(self, planner: TaskPlannerPort, executor: PlanExecutor) -> None:
+    A side-effecting plan is kept as a :class:`PendingApproval` bound to the
+    operator, machine and machine state that produced it.  Only that same
+    operator, on that same machine, against an unchanged state, may execute it;
+    a cancellation reply clears it, and an unrelated follow-up supersedes it.
+    """
+
+    def __init__(
+        self,
+        planner: TaskPlannerPort,
+        executor: PlanExecutor,
+        *,
+        events: EventRecorder | None = None,
+        approval_ttl_seconds: float = 300.0,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if approval_ttl_seconds <= 0:
+            raise ValueError("approval_ttl_seconds must be positive")
         self._planner = planner
         self._executor = executor
-        self._pending: dict[str, TaskPlan] = {}
+        self._events = events
+        self._approval_ttl = timedelta(seconds=float(approval_ttl_seconds))
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._pending: dict[str, PendingApproval] = {}
 
     async def handle(self, utterance: Utterance, machine: MachineSnapshot) -> AssistantResponse:
-        pending = self._pending.get(utterance.session_id)
-        if pending is not None and self._is_confirmation(utterance.text):
-            response = await self._executor.execute(
-                pending,
-                utterance=utterance,
-                machine=machine,
-                approved=True,
+        session_id = utterance.session_id
+        pending = self._pending.get(session_id)
+        kind = parse_confirmation(utterance.text)
+        if pending is not None and pending.is_expired(self._clock()):
+            self._pending.pop(session_id, None)
+            await self._record(
+                "approval/expired",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                plan_digest=pending.plan_digest,
+                expires_at=pending.expires_at.isoformat(),
             )
-            if response.category is not ResponseCategory.APPROVAL_REQUIRED:
-                self._pending.pop(utterance.session_id, None)
-            return response
+            if kind is ConfirmationKind.CONFIRM:
+                return AssistantResponse(
+                    "该操作的确认时限已过，未执行任何设备动作。请重新发起请求。",
+                    ResponseCategory.CLARIFICATION,
+                    metadata={
+                        "reason": "approval_expired",
+                        "plan_id": pending.plan.plan_id,
+                    },
+                )
+            pending = None
+        if (
+            pending is None
+            and kind is ConfirmationKind.CANCEL
+            and is_standalone_cancel(utterance.text)
+        ):
+            return self._no_pending_cancel()
+        if (
+            pending is None
+            and kind is ConfirmationKind.CONFIRM
+            and is_standalone_confirmation(utterance.text)
+        ):
+            return AssistantResponse(
+                "当前没有待确认的操作，设备未执行任何动作。",
+                ResponseCategory.INFORMATION,
+                metadata={"reason": "no_pending_approval"},
+            )
+        if pending is not None:
+            if kind is ConfirmationKind.CONFIRM:
+                return await self._approve(pending, utterance, machine)
+            if kind is ConfirmationKind.CANCEL:
+                self._pending.pop(session_id, None)
+                await self._record(
+                    "approval/rejected",
+                    session_id,
+                    plan_id=pending.plan.plan_id,
+                    plan_digest=pending.plan_digest,
+                    operator_id=utterance.operator_id,
+                    reason="operator_cancel",
+                )
+                return AssistantResponse(
+                    "已取消待确认操作，设备未执行任何动作。",
+                    ResponseCategory.INFORMATION,
+                    metadata={
+                        "reason": "approval_cancelled",
+                        "plan_id": pending.plan.plan_id,
+                    },
+                )
+            # A different request replaces the unconfirmed plan. It is never
+            # silently kept, so a later "确认" cannot execute a stale action.
+            self._pending.pop(session_id, None)
+            await self._record(
+                "approval/superseded",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                plan_digest=pending.plan_digest,
+                operator_id=utterance.operator_id,
+                text=utterance.text[:200],
+            )
         with tracing.span("plan.build", input=utterance.text) as scope:
             plan = await self._planner.build(utterance, machine)
             scope.output = {
@@ -955,15 +1176,168 @@ class TaskOrchestrator:
             }
         response = await self._executor.execute(plan, utterance=utterance, machine=machine)
         if response.category is ResponseCategory.APPROVAL_REQUIRED:
-            self._pending[utterance.session_id] = plan
+            now = self._clock()
+            approval = PendingApproval(
+                plan=plan,
+                session_id=session_id,
+                operator_id=utterance.operator_id,
+                machine_id=machine.machine_id,
+                plan_digest=plan_digest(plan),
+                machine_signature=machine_signature(machine),
+                requested_at=now,
+                expires_at=now + self._approval_ttl,
+            )
+            self._pending[session_id] = approval
+            await self._record(
+                "approval/requested",
+                session_id,
+                plan_id=plan.plan_id,
+                plan_digest=approval.plan_digest,
+                operator_id=utterance.operator_id,
+                machine_id=machine.machine_id,
+                expires_at=approval.expires_at.isoformat(),
+            )
+            metadata = dict(response.metadata)
+            metadata["approval"] = {
+                "plan_id": plan.plan_id,
+                "plan_digest": approval.plan_digest,
+                "operator_id": utterance.operator_id,
+                "machine_id": machine.machine_id,
+                "expires_at": approval.expires_at.isoformat(),
+            }
+            minutes = self._approval_ttl.total_seconds() / 60
+            hint = (
+                f"请在 {minutes:g} 分钟内由发起人本人确认；"
+                "设备状态发生变化后该方案将自动失效。"
+            )
+            response = replace(
+                response,
+                text=f"{response.text}\n\n{hint}",
+                metadata=metadata,
+            )
         else:
-            self._pending.pop(utterance.session_id, None)
+            self._pending.pop(session_id, None)
         return response
 
-    @staticmethod
-    def _is_confirmation(text: str) -> bool:
-        normalized = text.casefold().strip()
-        return any(
-            phrase in normalized
-            for phrase in ("确认", "确认执行", "同意", "执行吧", "yes", "approve", "proceed")
+    async def _approve(
+        self,
+        pending: PendingApproval,
+        utterance: Utterance,
+        machine: MachineSnapshot,
+    ) -> AssistantResponse:
+        session_id = utterance.session_id
+        if plan_digest(pending.plan) != pending.plan_digest:
+            self._pending.pop(session_id, None)
+            await self._record(
+                "approval/plan_changed",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                operator_id=utterance.operator_id,
+            )
+            return AssistantResponse(
+                "待确认方案在生成后发生了变化，未执行。请重新发起请求。",
+                ResponseCategory.CLARIFICATION,
+                metadata={
+                    "reason": "approval_plan_changed",
+                    "plan_id": pending.plan.plan_id,
+                },
+            )
+        if pending.operator_id != utterance.operator_id:
+            await self._record(
+                "approval/operator_mismatch",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                expected_operator=pending.operator_id,
+                actual_operator=utterance.operator_id,
+            )
+            return AssistantResponse(
+                "该操作只能由发起人本人确认，当前回复不会执行。请让发起人确认，或重新发起请求。",
+                ResponseCategory.CLARIFICATION,
+                metadata={
+                    "reason": "approval_operator_mismatch",
+                    "plan_id": pending.plan.plan_id,
+                },
+            )
+        if pending.machine_id != machine.machine_id:
+            await self._record(
+                "approval/machine_mismatch",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                expected_machine=pending.machine_id,
+                actual_machine=machine.machine_id,
+            )
+            return AssistantResponse(
+                f"该操作针对设备 {pending.machine_id}，当前设备是 {machine.machine_id}，未执行。",
+                ResponseCategory.CLARIFICATION,
+                metadata={
+                    "reason": "approval_machine_mismatch",
+                    "plan_id": pending.plan.plan_id,
+                },
+            )
+        if machine_signature(machine) != pending.machine_signature:
+            self._pending.pop(session_id, None)
+            await self._record(
+                "approval/state_changed",
+                session_id,
+                plan_id=pending.plan.plan_id,
+                machine_id=machine.machine_id,
+                operator_id=utterance.operator_id,
+            )
+            return AssistantResponse(
+                "设备状态在方案生成后已发生变化，原操作已失效，未执行。请重新发起请求。",
+                ResponseCategory.CLARIFICATION,
+                metadata={
+                    "reason": "approval_state_changed",
+                    "plan_id": pending.plan.plan_id,
+                },
+            )
+        # Approval is single-use: consume it before execution so a duplicate or
+        # concurrent confirmation cannot run the actuation twice.
+        self._pending.pop(session_id, None)
+        await self._record(
+            "approval/confirmed",
+            session_id,
+            plan_id=pending.plan.plan_id,
+            plan_digest=pending.plan_digest,
+            operator_id=utterance.operator_id,
+            machine_id=machine.machine_id,
         )
+        return await self._executor.execute(
+            pending.plan,
+            utterance=utterance,
+            machine=machine,
+            approved=True,
+        )
+
+    @staticmethod
+    def _no_pending_cancel() -> AssistantResponse:
+        return AssistantResponse(
+            "当前没有待确认的操作，设备未执行任何动作。",
+            ResponseCategory.INFORMATION,
+            metadata={"reason": "no_pending_approval"},
+        )
+
+    async def cancel_pending(
+        self, session_id: str, *, reason: str = "session_cleared"
+    ) -> bool:
+        """Drop a session's unconfirmed plan (e.g. when its history is deleted).
+
+        Without this, clearing a conversation would leave an approval alive that
+        a later "确认执行" in the same session could still run.
+        """
+        pending = self._pending.pop(session_id, None)
+        if pending is None:
+            return False
+        await self._record(
+            "approval/rejected",
+            session_id,
+            plan_id=pending.plan.plan_id,
+            plan_digest=pending.plan_digest,
+            operator_id=pending.operator_id,
+            reason=reason,
+        )
+        return True
+
+    async def _record(self, event_type: str, session_id: str, **payload: object) -> None:
+        if self._events is not None:
+            await self._events.record(event_type, session_id, **payload)
